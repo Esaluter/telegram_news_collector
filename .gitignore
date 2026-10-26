@@ -1,0 +1,10 @@
+.env
+data/*.json
+data/*.tmp
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+import_output/
+*.zip
+
