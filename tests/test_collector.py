@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -9,7 +10,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from apps_script_client import AppsScriptError
-from collector import CollectorRuntime, PeriodCounters, Settings, format_status_report
+from collector import (
+    CollectorRuntime,
+    PeriodCounters,
+    Settings,
+    configure_logging,
+    format_status_report,
+)
 from import_history import prepare_rows, send_batches
 from news_record import build_sheet_record, get_news_links, target_hashtags
 from storage import NewsStorage, load_news
@@ -211,6 +218,38 @@ class SettingsTests(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(ValueError, "must differ"):
                 Settings.from_environment()
+
+
+class LoggingTests(unittest.TestCase):
+    def test_http_client_info_logs_are_suppressed(self):
+        httpx_logger = logging.getLogger("httpx")
+        httpcore_logger = logging.getLogger("httpcore")
+        application_logger = logging.getLogger("telegram_news_collector")
+        original_levels = (
+            httpx_logger.level,
+            httpcore_logger.level,
+            application_logger.level,
+        )
+        try:
+            httpx_logger.setLevel(logging.NOTSET)
+            httpcore_logger.setLevel(logging.NOTSET)
+            application_logger.setLevel(logging.NOTSET)
+            with patch.dict(os.environ, {"LOG_LEVEL": "INFO"}), patch(
+                "collector.logging.basicConfig"
+            ) as basic_config:
+                configure_logging()
+
+            basic_config.assert_called_once_with(
+                level="INFO",
+                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            )
+            self.assertEqual(logging.WARNING, httpx_logger.level)
+            self.assertEqual(logging.WARNING, httpcore_logger.level)
+            self.assertEqual(logging.NOTSET, application_logger.level)
+        finally:
+            httpx_logger.setLevel(original_levels[0])
+            httpcore_logger.setLevel(original_levels[1])
+            application_logger.setLevel(original_levels[2])
 
 
 class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):

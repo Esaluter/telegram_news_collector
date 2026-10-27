@@ -340,12 +340,18 @@ def build_application(settings: Settings) -> Application:
     return application
 
 
-def main() -> None:
-    load_dotenv()
+def configure_logging() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def main() -> None:
+    load_dotenv()
+    configure_logging()
     settings = Settings.from_environment()
     settings.archive_path.parent.mkdir(parents=True, exist_ok=True)
     application = build_application(settings)
