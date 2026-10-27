@@ -1,0 +1,33 @@
+# Version control and local configuration
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Python environments, caches and build artefacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Runtime data, archives and temporary files
+data/
+import_output/
+*.json
+*.tmp
+*.zip
+*.log
+
+# Development-only files
+tests/
+apps_script/
+README.md
+Procfile
+import_history.py
