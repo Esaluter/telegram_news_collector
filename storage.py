@@ -130,6 +130,11 @@ class NewsStorage:
             records = await asyncio.to_thread(load_news, self.path)
             return [record for record in records if record_is_pending(record)][:limit]
 
+    async def pending_count(self) -> int:
+        async with self._lock:
+            records = await asyncio.to_thread(load_news, self.path)
+            return sum(record_is_pending(record) for record in records)
+
     async def mark_results(
         self, results: list[dict[str, Any]], error: str | None = None
     ) -> None:

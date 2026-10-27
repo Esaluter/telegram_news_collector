@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from apps_script_client import AppsScriptError
+from collector import CollectorRuntime, PeriodCounters, Settings, format_status_report
 from import_history import prepare_rows, send_batches
 from news_record import build_sheet_record, get_news_links, target_hashtags
 from storage import NewsStorage, load_news
@@ -74,6 +78,37 @@ class FakeAppsScript:
         return {"ok": True}
 
 
+class FakeBot:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.messages = []
+
+    async def send_message(self, chat_id, text, parse_mode=None):
+        if self.fail:
+            raise RuntimeError("simulated_control_delivery_failure")
+        self.messages.append(
+            {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+        )
+
+
+def runtime_settings(
+    status_chat_id=-1003732301710,
+    google_sheet_url="https://docs.google.com/spreadsheets/d/test/edit",
+):
+    return Settings(
+        bot_token="test-token",
+        group_id=GROUP_ID,
+        apps_script_url="https://example.invalid/exec",
+        apps_script_secret="test-secret",
+        archive_path=Path("unused.json"),
+        batch_size=50,
+        retry_seconds=60,
+        request_timeout_seconds=20,
+        status_chat_id=status_chat_id,
+        google_sheet_url=google_sheet_url,
+    )
+
+
 class TelegramRulesTests(unittest.TestCase):
     def test_standalone_hashtags_keep_existing_rules(self):
         self.assertEqual(["#ижс", "#корп"], target_hashtags({"text": "#ИЖС и #КоРп"}))
@@ -105,6 +140,7 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("duplicate", duplicate["status"])
             self.assertEqual("skipped", skipped["status"])
             self.assertEqual(1, len(load_news(storage.path)))
+            self.assertEqual(1, await storage.pending_count())
 
     async def test_partial_sheet_failure_is_retried_without_overwriting_manual_data(self):
         with tempfile.TemporaryDirectory() as root:
@@ -149,6 +185,111 @@ class HistoricalImportTests(unittest.TestCase):
         self.assertEqual(3, second["records"])
         self.assertEqual(3, len(remote.all_news))
         self.assertEqual(2, len(remote.tagged))
+
+
+class SettingsTests(unittest.TestCase):
+    def test_status_chat_is_optional(self):
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GROUP_ID": str(GROUP_ID),
+            "GOOGLE_APPS_SCRIPT_URL": "https://example.invalid/exec",
+            "GOOGLE_APPS_SCRIPT_SECRET": "secret",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            settings = Settings.from_environment()
+            self.assertIsNone(settings.status_chat_id)
+            self.assertIsNone(settings.google_sheet_url)
+
+    def test_status_chat_cannot_be_news_group(self):
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "GROUP_ID": str(GROUP_ID),
+            "GOOGLE_APPS_SCRIPT_URL": "https://example.invalid/exec",
+            "GOOGLE_APPS_SCRIPT_SECRET": "secret",
+            "STATUS_CHAT_ID": str(GROUP_ID),
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                Settings.from_environment()
+
+
+class StatusNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_period_counters_reset_after_snapshot(self):
+        counters = PeriodCounters(
+            received=5, new=3, duplicates=1, google_written=2, skipped=2, errors=1
+        )
+        snapshot = counters.snapshot_and_reset()
+        self.assertEqual(5, snapshot["received"])
+        self.assertEqual(2, snapshot["google_written"])
+        self.assertEqual(PeriodCounters(), counters)
+        report = format_status_report(snapshot, 4)
+        self.assertIn("Получено сообщений: 5", report)
+        self.assertIn("Ожидают отправки: 4", report)
+        self.assertNotIn("Открыть Google Таблицу", report)
+
+    async def test_report_includes_optional_clickable_google_sheet_link(self):
+        report = format_status_report(
+            PeriodCounters().snapshot_and_reset(),
+            0,
+            "https://docs.google.com/spreadsheets/d/test/edit?usp=sharing&x=1",
+        )
+        self.assertIn(
+            '<a href="https://docs.google.com/spreadsheets/d/test/edit?usp=sharing&amp;x=1">'
+            "📊 Открыть Google Таблицу</a>",
+            report,
+        )
+
+    async def test_delivery_counters_keep_categories_separate(self):
+        runtime = CollectorRuntime(runtime_settings())
+        runtime.record_delivery("new")
+        runtime.record_delivery("duplicate")
+        runtime.record_delivery("skipped")
+        self.assertEqual(3, runtime.counters.received)
+        self.assertEqual(1, runtime.counters.new)
+        self.assertEqual(1, runtime.counters.duplicates)
+        self.assertEqual(1, runtime.counters.skipped)
+
+    async def test_notifications_are_disabled_without_status_chat(self):
+        runtime = CollectorRuntime(runtime_settings(status_chat_id=None))
+        runtime.bot = FakeBot()
+        self.assertFalse(await runtime.send_control_message("test"))
+        self.assertEqual([], runtime.bot.messages)
+
+    async def test_control_delivery_failure_does_not_escape(self):
+        runtime = CollectorRuntime(runtime_settings())
+        runtime.bot = FakeBot(fail=True)
+        self.assertFalse(await runtime.send_control_message("test"))
+
+    async def test_identical_google_warning_is_suppressed_until_recovery(self):
+        runtime = CollectorRuntime(runtime_settings())
+        runtime.bot = FakeBot()
+        error = AppsScriptError("sensitive detail must not be sent")
+        await runtime.notify_google_error(error)
+        await runtime.notify_google_error(error)
+        self.assertEqual(1, len(runtime.bot.messages))
+        self.assertNotIn("sensitive detail", runtime.bot.messages[0]["text"])
+        runtime.note_google_success()
+        await runtime.notify_google_error(error)
+        self.assertEqual(2, len(runtime.bot.messages))
+
+    async def test_periodic_report_uses_current_queue_and_resets_period(self):
+        runtime = CollectorRuntime(runtime_settings())
+        runtime.bot = FakeBot()
+
+        class QueueStorage:
+            async def pending_count(self):
+                return 7
+
+        runtime.storage = QueueStorage()
+        runtime.counters.received = 2
+        runtime.counters.new = 2
+        await runtime.send_periodic_report()
+        self.assertEqual(1, len(runtime.bot.messages))
+        self.assertIn("Получено сообщений: 2", runtime.bot.messages[0]["text"])
+        self.assertIn("Ожидают отправки: 7", runtime.bot.messages[0]["text"])
+        self.assertIn("📊 Открыть Google Таблицу", runtime.bot.messages[0]["text"])
+        self.assertEqual("HTML", runtime.bot.messages[0]["parse_mode"])
+        self.assertEqual(PeriodCounters(), runtime.counters)
 
 
 if __name__ == "__main__":
